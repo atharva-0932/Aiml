@@ -1,0 +1,183 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>AML Investigation Report — {{ case_id }}</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;700&display=swap');
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: 'Inter', sans-serif; color: #1a1a2e; background: #fff; font-size: 11pt; }
+
+  .cover {
+    background: linear-gradient(135deg, #0d1117 0%, #1a1a2e 60%, #16213e 100%);
+    color: #fff; padding: 60px 50px; min-height: 220px;
+    border-bottom: 4px solid {{ risk_color }};
+  }
+  .cover h1 { font-size: 26pt; font-weight: 700; letter-spacing: 1px; }
+  .cover .subtitle { color: #8892b0; margin-top: 8px; font-size: 11pt; }
+  .cover .badges { display: flex; gap: 12px; margin-top: 20px; flex-wrap: wrap; }
+  .badge {
+    padding: 4px 14px; border-radius: 20px; font-size: 9pt; font-weight: 600;
+    border: 1.5px solid {{ risk_color }}; color: {{ risk_color }};
+  }
+
+  .section { padding: 24px 50px; border-bottom: 1px solid #e8e8f0; }
+  .section h2 { font-size: 13pt; font-weight: 700; color: #0d1117; margin-bottom: 14px;
+                text-transform: uppercase; letter-spacing: 0.5px;
+                border-left: 4px solid {{ risk_color }}; padding-left: 12px; }
+  .section p { line-height: 1.7; color: #444; }
+
+  .score-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; }
+  .score-card {
+    background: #f7f8fc; border-radius: 10px; padding: 18px; text-align: center;
+    border-top: 3px solid {{ risk_color }};
+  }
+  .score-card .value { font-size: 22pt; font-weight: 700; color: {{ risk_color }}; }
+  .score-card .label { font-size: 8pt; color: #888; margin-top: 4px; text-transform: uppercase; }
+
+  .rules { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+  .rule-tag {
+    background: #fff3cd; border: 1px solid #ffc107; color: #856404;
+    padding: 3px 10px; border-radius: 12px; font-size: 8.5pt; font-weight: 600;
+  }
+
+  table { width: 100%; border-collapse: collapse; margin-top: 12px; font-size: 9pt; }
+  th { background: #0d1117; color: #fff; padding: 8px 10px; text-align: left; font-weight: 600; }
+  td { padding: 7px 10px; border-bottom: 1px solid #eee; }
+  tr:nth-child(even) td { background: #f9f9fb; }
+  .flagged td { background: #fff5f5 !important; }
+
+  .ai-box {
+    background: #f0f4ff; border-left: 4px solid #4a90e2; padding: 18px 20px;
+    border-radius: 0 8px 8px 0; margin-top: 12px; line-height: 1.8;
+  }
+
+  .graph-img { max-width: 100%; border-radius: 8px; border: 1px solid #ddd; margin-top: 12px; }
+
+  .footer {
+    background: #0d1117; color: #8892b0; padding: 16px 50px;
+    font-size: 8pt; display: flex; justify-content: space-between;
+  }
+
+  .action-box {
+    padding: 14px 20px; border-radius: 8px; font-weight: 700; font-size: 12pt;
+    text-align: center; color: #fff; background: {{ risk_color }};
+    margin-top: 14px;
+  }
+
+  @page { size: A4; margin: 0; }
+</style>
+</head>
+<body>
+
+<!-- ── Cover ─────────────────────────────────────────────────────────────── -->
+<div class="cover">
+  <h1>AML INVESTIGATION REPORT</h1>
+  <div class="subtitle">Financial Intelligence Unit — Confidential</div>
+  <div class="badges">
+    <span class="badge">Case: {{ case_id }}</span>
+    <span class="badge">Risk: {{ risk_tier }}</span>
+    <span class="badge">{{ report_date }}</span>
+    <span class="badge">Investigator: {{ investigator_name }}</span>
+  </div>
+</div>
+
+<!-- ── Risk Score Summary ─────────────────────────────────────────────────── -->
+<div class="section">
+  <h2>Risk Score Summary</h2>
+  <div class="score-grid">
+    <div class="score-card">
+      <div class="value">{{ composite_score }}</div>
+      <div class="label">Composite Score /100</div>
+    </div>
+    <div class="score-card">
+      <div class="value">{{ classifier_score }}%</div>
+      <div class="label">XGBoost Fraud Prob.</div>
+    </div>
+    <div class="score-card">
+      <div class="value">{{ anomaly_score }}%</div>
+      <div class="label">Anomaly Score</div>
+    </div>
+    <div class="score-card">
+      <div class="value">{{ graph_risk_score }}%</div>
+      <div class="label">Graph Risk Score</div>
+    </div>
+  </div>
+</div>
+
+<!-- ── Triggered Rules ────────────────────────────────────────────────────── -->
+<div class="section">
+  <h2>Detection Rules Triggered</h2>
+  {% if triggered_rules %}
+  <div class="rules">
+    {% for rule in triggered_rules %}
+    <span class="rule-tag">{{ rule.replace('_', ' ').upper() }}</span>
+    {% endfor %}
+  </div>
+  {% else %}
+  <p>No specific rules triggered — flagged by ML anomaly score.</p>
+  {% endif %}
+</div>
+
+<!-- ── AI Investigation Summary ───────────────────────────────────────────── -->
+{% if ai_summary %}
+<div class="section">
+  <h2>AI Investigation Summary</h2>
+  <div class="ai-box">{{ ai_summary | replace('\n', '<br>') }}</div>
+</div>
+{% endif %}
+
+<!-- ── Transaction Evidence ───────────────────────────────────────────────── -->
+<div class="section">
+  <h2>Transaction Evidence</h2>
+  <table>
+    <tr>
+      <th>Timestamp</th>
+      <th>Amount</th>
+      <th>Type</th>
+      <th>Channel</th>
+      <th>Pattern</th>
+      <th>Flagged</th>
+    </tr>
+    {% for tx in transactions %}
+    <tr{% if tx.is_flagged %} class="flagged"{% endif %}>
+      <td>{{ tx.timestamp | string | truncate(19, True, '') }}</td>
+      <td>${{ "%.2f" | format(tx.amount | float) }}</td>
+      <td>{{ tx.transaction_type or '—' }}</td>
+      <td>{{ tx.channel or '—' }}</td>
+      <td>{{ tx.aml_label or 'normal' }}</td>
+      <td>{{ '⚠ YES' if tx.is_flagged else 'No' }}</td>
+    </tr>
+    {% endfor %}
+  </table>
+</div>
+
+<!-- ── Graph Visualisation ────────────────────────────────────────────────── -->
+{% if graph_image_b64 %}
+<div class="section">
+  <h2>Transaction Graph Snapshot</h2>
+  <img class="graph-img" src="data:image/png;base64,{{ graph_image_b64 }}" alt="Graph"/>
+</div>
+{% endif %}
+
+<!-- ── Recommended Action ─────────────────────────────────────────────────── -->
+{% if sar_data %}
+<div class="section">
+  <h2>Recommended Action</h2>
+  <div class="action-box">{{ sar_data.get('recommended_action', 'ESCALATE TO FIU') }}</div>
+  {% if sar_data.get('confidence_justification') %}
+  <p style="margin-top:10px; color:#666;">{{ sar_data.confidence_justification }}</p>
+  {% endif %}
+</div>
+{% endif %}
+
+<!-- ── Footer ─────────────────────────────────────────────────────────────── -->
+<div class="footer">
+  <span>AML Fraud Intelligence Platform v1.0 — CONFIDENTIAL</span>
+  <span>Account: {{ account_id }}</span>
+  <span>{{ report_date }}</span>
+</div>
+
+</body>
+</html>
