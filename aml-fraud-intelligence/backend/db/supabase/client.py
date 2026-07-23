@@ -24,6 +24,16 @@ ON CONFLICT (transaction_id) DO UPDATE SET
   scored_at = NOW()
 """
 
+INSERT_ALERT = """
+INSERT INTO alerts (transaction_id, composite_score, pattern)
+VALUES ($1, $2, $3)
+"""
+
+INSERT_SHAP = """
+INSERT INTO shap_explanations (transaction_id, feature_name, shap_value)
+VALUES ($1, $2, $3)
+"""
+
 
 def _is_configured() -> bool:
     url = settings.supabase_db_url or ""
@@ -48,7 +58,7 @@ async def get_pool() -> asyncpg.Pool | None:
             dsn=settings.supabase_db_url,
             min_size=1,
             max_size=5,
-            statement_cache_size=0,  # required for pgBouncer transaction pooling
+            statement_cache_size=0,
         )
     return _pool
 
@@ -70,13 +80,10 @@ def _parse_ts(value: Any) -> datetime | None:
 
 
 async def upsert_transaction(tx: dict[str, Any], risk_score: float) -> None:
-    """Write scored transaction to Supabase transactions table (no-op if unconfigured)."""
     pool = await get_pool()
     if pool is None:
         return
-    pattern = tx.get("pattern_label")
-    if pattern == "" or pattern is None:
-        pattern = None
+    pattern = tx.get("pattern_label") or None
     async with pool.acquire() as conn:
         await conn.execute(
             UPSERT_TRANSACTION,
@@ -88,4 +95,25 @@ async def upsert_transaction(tx: dict[str, Any], risk_score: float) -> None:
             tx.get("bank"),
             pattern,
             float(risk_score),
+        )
+
+
+async def insert_alert(transaction_id: str, composite_score: float, pattern: str | None) -> None:
+    pool = await get_pool()
+    if pool is None:
+        return
+    async with pool.acquire() as conn:
+        await conn.execute(INSERT_ALERT, transaction_id, float(composite_score), pattern)
+
+
+async def insert_shap_explanations(
+    transaction_id: str, shap_rows: list[tuple[str, float]]
+) -> None:
+    pool = await get_pool()
+    if pool is None or not shap_rows:
+        return
+    async with pool.acquire() as conn:
+        await conn.executemany(
+            INSERT_SHAP,
+            [(transaction_id, name, float(val)) for name, val in shap_rows],
         )

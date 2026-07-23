@@ -55,9 +55,9 @@ Tiers: LOW < 30 | MEDIUM 30–70 | HIGH 70–90 | CRITICAL > 90
 | 3. Kafka producer + consumers | **Done** (stub scoring) |
 | 4. Redis velocity counters | Pending (hooks live in ml_scorer) |
 | 5. Neo4j graph sync + Cypher | **Done** (queries + GraphRiskScorer + tests) |
-| 6. XGBoost + SHAP | Pending |
+| 6. XGBoost + SHAP | **Done** (AUC≈0.995, composite wired into ml_scorer) |
 | 7. FastAPI endpoints | Pending |
-| 8. Supabase cold path | Pending (upsert hook live; needs real URL + migration) |
+| 8. Supabase cold path | Pending (upsert/alerts/shap hooks live) |
 | 9. Streamlit dashboard (3 pages) | Pending |
 | 10. Unit tests | Pending |
 
@@ -131,6 +131,27 @@ PYTHONPATH=backend python3 -m pytest tests/unit/test_graph.py -v
 
 `GraphRiskScorer` returns `graph_risk` 0–100 from cycles / mule / layering / PageRank.
 Not wired into Kafka consumers yet (Phase 5).
+
+## Phase 5 — XGBoost + SHAP + composite scorer
+
+```bash
+# Re-seed if needed (AML timestamps spread across the year for temporal split)
+PYTHONPATH=backend python3 -m data_simulation.seed
+
+# Train
+PYTHONPATH=backend python3 -m ml.train --csv data/transactions.csv
+
+# Unit tests
+PYTHONPATH=backend python3 -m pytest tests/unit/test_ml.py -v
+
+# Full pipeline (restart ml_scorer to load the new model)
+PYTHONPATH=backend python3 -m kafka.consumers.ml_scorer
+PYTHONPATH=backend python3 -m kafka.consumers.graph_sync
+PYTHONPATH=backend python3 -m kafka.producer --delay 0
+```
+
+Composite: `0.60 × XGBoost + 0.40 × GraphRisk`. Graph scores cached in Redis 1h.
+Artifacts: `backend/ml/models/model.json`, `feature_columns.json`, `training_metrics.json`.
 
 ## Constraints
 

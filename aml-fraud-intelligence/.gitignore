@@ -27,8 +27,7 @@ data/transactions.csv
 !data/.gitkeep
 
 # ML artifacts
-backend/ml/models/*.joblib
-backend/ml/models/*.pkl
+backend/ml/models/*
 !backend/ml/models/.gitkeep
 
 # Testing

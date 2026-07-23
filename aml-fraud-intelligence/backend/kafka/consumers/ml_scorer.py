@@ -1,22 +1,34 @@
 """
-ml_scorer consumer — velocity features from Redis, stub risk score,
-cache score in Redis, upsert to Supabase.
+ml_scorer consumer — Redis velocity + XGBoost + GraphRisk + composite score.
 
 Run: PYTHONPATH=backend python3 -m kafka.consumers.ml_scorer
 """
 from __future__ import annotations
 
 import asyncio
-import random
 
 from confluent_kafka import Consumer, KafkaError, KafkaException
 
 from core.config import settings
-from db.redis.cache import cache_risk_score, get_velocity_features, update_velocity
+from db.redis.cache import (
+    cache_graph_risk,
+    cache_risk_score,
+    get_cached_graph_risk,
+    get_velocity_features,
+    update_velocity,
+)
 from db.redis.client import close_redis
-from db.supabase.client import close_pool, upsert_transaction
+from db.supabase.client import (
+    close_pool,
+    insert_alert,
+    insert_shap_explanations,
+    upsert_transaction,
+)
+from graph.scorer import GraphRiskScorer
 from kafka.serde import deserialize_transaction
 from kafka.topics import TX_RAW, ensure_topics
+from ml.features import extract_features
+from ml.scorer import CompositeRiskScorer, XGBoostScorer
 
 
 def _build_consumer() -> Consumer:
@@ -28,37 +40,62 @@ def _build_consumer() -> Consumer:
     })
 
 
-def _stub_risk_score(velocity: dict[str, float], tx: dict) -> float:
-    """Placeholder until Phase 5 XGBoost. Returns 0–100."""
-    base = random.uniform(0, 100)
-    if velocity["tx_count_1h"] > 10:
-        base = min(100.0, base + 15)
-    if tx.get("pattern_label"):
-        base = min(100.0, max(base, 70.0))
-    return round(base, 2)
+async def _graph_score_cached(graph_scorer: GraphRiskScorer, account_id: str) -> dict:
+    cached = await get_cached_graph_risk(account_id)
+    if cached is not None:
+        return cached
+    result = await graph_scorer.score(account_id)
+    await cache_graph_risk(account_id, result)
+    return result
 
 
-async def process_message(tx: dict) -> float:
+async def process_message(
+    tx: dict,
+    xgb_scorer: XGBoostScorer,
+    graph_scorer: GraphRiskScorer,
+    composite_scorer: CompositeRiskScorer,
+) -> dict:
     sender = tx["sender_account"]
     receiver = tx["receiver_account"]
     amount = float(tx["amount"])
 
     velocity = await get_velocity_features(sender)
-    score = _stub_risk_score(velocity, tx)
+    features = extract_features(tx, velocity=velocity, amount_mean=xgb_scorer.amount_mean)
+    xgb_score = xgb_scorer.score(features)
+    graph = await _graph_score_cached(graph_scorer, sender)
+    combined = composite_scorer.composite(xgb_score, float(graph.get("graph_risk", 0.0)))
 
-    await cache_risk_score(tx["transaction_id"], score)
+    shap_top = xgb_scorer.shap_top_features(features, top_k=5)
+
+    await cache_risk_score(tx["transaction_id"], combined["composite_score"])
     await update_velocity(sender, receiver, amount)
-    await upsert_transaction(tx, score)
-    return score
+    await upsert_transaction(tx, combined["composite_score"])
+    await insert_shap_explanations(tx["transaction_id"], shap_top)
+
+    if combined["composite_score"] > 70:
+        await insert_alert(
+            tx["transaction_id"],
+            combined["composite_score"],
+            tx.get("pattern_label"),
+        )
+
+    return {
+        **combined,
+        "flags": graph.get("flags", []),
+        "shap_top": shap_top,
+    }
 
 
 async def run() -> None:
     ensure_topics()
+    xgb_scorer = XGBoostScorer()
+    graph_scorer = GraphRiskScorer()
+    composite_scorer = CompositeRiskScorer()
+
     consumer = _build_consumer()
     consumer.subscribe([TX_RAW])
-    print(f"ml_scorer listening on {TX_RAW} (group=ml_scorer)")
+    print(f"ml_scorer listening on {TX_RAW} (group=ml_scorer, XGBoost+Graph composite)")
     processed = 0
-    labeled_seen = 0
 
     try:
         while True:
@@ -73,18 +110,15 @@ async def run() -> None:
 
             try:
                 tx = deserialize_transaction(msg.value())
-                score = await process_message(tx)
+                result = await process_message(tx, xgb_scorer, graph_scorer, composite_scorer)
                 consumer.commit(asynchronous=False)
                 processed += 1
                 label = tx.get("pattern_label")
-                if label:
-                    labeled_seen += 1
-                # Log first few, every 100th, and every labeled AML pattern
-                if processed % 100 == 0 or processed <= 5 or label:
+                if processed % 100 == 0 or processed <= 5 or label or result["composite_score"] > 70:
                     print(
                         f"[{processed}] tx={tx['transaction_id'][:8]}… "
-                        f"score={score:.2f} label={label!r} "
-                        f"(labeled_total={labeled_seen})"
+                        f"score={result['composite_score']:.1f} tier={result['tier']} "
+                        f"label={label} flags={result['flags']}"
                     )
             except Exception as exc:
                 print(f"ERROR processing message: {exc}")

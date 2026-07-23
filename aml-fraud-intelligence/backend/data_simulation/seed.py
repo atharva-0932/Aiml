@@ -27,9 +27,15 @@ from data_simulation.aml_patterns import (
     generate_structuring,
 )
 from data_simulation.normal_transactions import generate_normal_batch
-from data_simulation.schema import PATTERN_LABELS, TX_COLUMNS, make_account
+from data_simulation.schema import PATTERN_LABELS, TX_COLUMNS, make_account, random_timestamp
 
 DATA_DIR = Path(__file__).resolve().parent.parent.parent / "data"
+
+
+def _episode_base_time() -> datetime:
+    """Spread AML episodes across the same ~1y window as normal traffic (temporal split)."""
+    now = datetime.now(timezone.utc)
+    return random_timestamp(now.replace(year=now.year - 1), now)
 
 
 def generate_dataset(n_normal: int = 47_000) -> tuple[list[dict], list[dict]]:
@@ -43,45 +49,54 @@ def generate_dataset(n_normal: int = 47_000) -> tuple[list[dict], list[dict]]:
     print(f"Generating {n_normal:,} normal transactions...")
     transactions = generate_normal_batch(active, n=n_normal)
 
-    print("Generating AML pattern episodes...")
-    base = datetime.now(timezone.utc)
+    print("Generating AML pattern episodes (timestamps spread across past year)...")
 
     # Structuring: 60 × 8 ≈ 480
     for _ in range(60):
         sender = random.choice(active)
         receivers = random.sample(active, min(5, len(active)))
-        transactions.extend(generate_structuring(sender, receivers, base_time=base))
+        transactions.extend(
+            generate_structuring(sender, receivers, base_time=_episode_base_time())
+        )
 
     # Layering: 120 × ~6 ≈ 720
     for _ in range(120):
         chain = random.sample(active, min(9, len(active)))
         transactions.extend(
-            generate_layering(chain, base_time=base, n_hops=random.randint(4, 8))
+            generate_layering(
+                chain, base_time=_episode_base_time(), n_hops=random.randint(4, 8)
+            )
         )
 
     # Circular: 100 × 3 ≈ 300
     for _ in range(100):
         ring = random.sample(active, min(4, len(active)))
-        transactions.extend(generate_circular(ring, base_time=base))
+        transactions.extend(generate_circular(ring, base_time=_episode_base_time()))
 
     # Mule: 55 × ~13 ≈ 715
     for _ in range(55):
         mule = random.choice(active)
         senders = random.sample([a for a in active if a["id"] != mule["id"]], 12)
         dest = random.choice([a for a in active if a["id"] != mule["id"]])
-        transactions.extend(generate_mule(mule, senders, dest, base_time=base))
+        transactions.extend(
+            generate_mule(mule, senders, dest, base_time=_episode_base_time())
+        )
 
     # Dormant activation: up to 45 × 5 ≈ 225
     if dormant:
         for _ in range(min(45, len(dormant))):
             d = random.choice(dormant)
             receivers = random.sample(active, min(5, len(active)))
-            transactions.extend(generate_dormant_activation(d, receivers, base_time=base))
+            transactions.extend(
+                generate_dormant_activation(d, receivers, base_time=_episode_base_time())
+            )
 
     # Rapid multi-hop: 90 × ~6 ≈ 540
     for _ in range(90):
         chain = random.sample(active, min(7, len(active)))
-        transactions.extend(generate_rapid_multihop(chain, base_time=base))
+        transactions.extend(
+            generate_rapid_multihop(chain, base_time=_episode_base_time())
+        )
 
     return accounts, transactions
 
