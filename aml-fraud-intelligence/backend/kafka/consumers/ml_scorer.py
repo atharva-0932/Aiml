@@ -1,60 +1,64 @@
 """
-ML Scorer Consumer — the hot-path core.
-Subscribes to transactions.raw, scores each transaction using pre-loaded
-models + Redis velocity features, writes to Redis cache, routes to
-transactions.scored or transactions.flagged.
+ml_scorer consumer — velocity features from Redis, stub risk score,
+cache score in Redis, upsert to Supabase.
 
-Models are loaded ONCE at startup — never per message.
+Run: PYTHONPATH=backend python3 -m kafka.consumers.ml_scorer
 """
 from __future__ import annotations
 
 import asyncio
-import json
+import random
 
-from confluent_kafka import Consumer, Producer, KafkaError
+from confluent_kafka import Consumer, KafkaError, KafkaException
+
 from core.config import settings
-from core.logging import get_logger
-from db.redis import cache as redis_cache
-from kafka import topics as T
-
-log = get_logger(__name__)
-
-_scorer = None  # Loaded lazily at startup
-
-
-def _load_scorer():
-    global _scorer
-    if _scorer is None:
-        from ml.risk_scorer import CompositeRiskScorer
-        _scorer = CompositeRiskScorer()
-        log.info("CompositeRiskScorer loaded into memory")
-    return _scorer
+from db.redis.cache import cache_risk_score, get_velocity_features, update_velocity
+from db.redis.client import close_redis
+from db.supabase.client import close_pool, upsert_transaction
+from kafka.serde import deserialize_transaction
+from kafka.topics import TX_RAW, ensure_topics
 
 
 def _build_consumer() -> Consumer:
     return Consumer({
         "bootstrap.servers": settings.kafka_bootstrap_servers,
-        "group.id": "aml-ml-scorer",
+        "group.id": "ml_scorer",
         "auto.offset.reset": "earliest",
         "enable.auto.commit": False,
-        "max.poll.interval.ms": 30000,
     })
 
 
-def _build_producer() -> Producer:
-    return Producer({
-        "bootstrap.servers": settings.kafka_bootstrap_servers,
-        "linger.ms": 5,
-        "compression.type": "lz4",
-    })
+def _stub_risk_score(velocity: dict[str, float], tx: dict) -> float:
+    """Placeholder until Phase 5 XGBoost. Returns 0–100."""
+    base = random.uniform(0, 100)
+    if velocity["tx_count_1h"] > 10:
+        base = min(100.0, base + 15)
+    if tx.get("pattern_label"):
+        base = min(100.0, max(base, 70.0))
+    return round(base, 2)
+
+
+async def process_message(tx: dict) -> float:
+    sender = tx["sender_account"]
+    receiver = tx["receiver_account"]
+    amount = float(tx["amount"])
+
+    velocity = await get_velocity_features(sender)
+    score = _stub_risk_score(velocity, tx)
+
+    await cache_risk_score(tx["transaction_id"], score)
+    await update_velocity(sender, receiver, amount)
+    await upsert_transaction(tx, score)
+    return score
 
 
 async def run() -> None:
-    scorer = _load_scorer()
+    ensure_topics()
     consumer = _build_consumer()
-    producer = _build_producer()
-    consumer.subscribe([T.TX_RAW])
-    log.info("ML scorer consumer started", topic=T.TX_RAW)
+    consumer.subscribe([TX_RAW])
+    print(f"ml_scorer listening on {TX_RAW} (group=ml_scorer)")
+    processed = 0
+    labeled_seen = 0
 
     try:
         while True:
@@ -63,36 +67,32 @@ async def run() -> None:
                 await asyncio.sleep(0)
                 continue
             if msg.error():
-                if msg.error().code() != KafkaError._PARTITION_EOF:
-                    log.error("Kafka consumer error", error=str(msg.error()))
-                continue
+                if msg.error().code() == KafkaError._PARTITION_EOF:
+                    continue
+                raise KafkaException(msg.error())
 
             try:
-                tx = json.loads(msg.value())
-                account_id = tx.get("sender_account_id", "")
-
-                # Pull velocity features from Redis (<1ms)
-                velocity = await redis_cache.get_velocity(account_id)
-                tx.update(velocity)
-
-                # Score in-memory
-                score = scorer.score(tx)
-
-                # Cache in Redis (write-through)
-                await redis_cache.cache_risk_score(account_id, tx["id"], score)
-
-                # Route to downstream topic
-                dest_topic = T.TX_FLAGGED if score["composite_score"] >= T.THRESHOLD_HIGH else T.TX_SCORED
-                payload = json.dumps({**tx, "risk_score": score}, default=str).encode()
-                producer.produce(dest_topic, key=tx["id"].encode(), value=payload)
-                producer.poll(0)
-
-                # Manual commit only after successful processing
+                tx = deserialize_transaction(msg.value())
+                score = await process_message(tx)
                 consumer.commit(asynchronous=False)
-
+                processed += 1
+                label = tx.get("pattern_label")
+                if label:
+                    labeled_seen += 1
+                # Log first few, every 100th, and every labeled AML pattern
+                if processed % 100 == 0 or processed <= 5 or label:
+                    print(
+                        f"[{processed}] tx={tx['transaction_id'][:8]}… "
+                        f"score={score:.2f} label={label!r} "
+                        f"(labeled_total={labeled_seen})"
+                    )
             except Exception as exc:
-                log.error("Error processing transaction", error=str(exc))
-
+                print(f"ERROR processing message: {exc}")
     finally:
         consumer.close()
-        log.info("ML scorer consumer stopped")
+        await close_redis()
+        await close_pool()
+
+
+if __name__ == "__main__":
+    asyncio.run(run())

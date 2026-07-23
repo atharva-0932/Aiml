@@ -1,170 +1,133 @@
 """
-Full dataset seeding script.
-Generates ~50,000 transactions (normal + all AML patterns) and outputs:
-  - data/accounts.csv
-  - data/transactions.csv
-  - data/customers.csv
+Full dataset seeder — Phase 1.
 
-Then optionally loads to Snowflake via COPY INTO.
+Generates ~50,000 transactions (normal + all AML patterns) and writes:
+  data/transactions.csv
 
-Run: python -m data_simulation.seed [--no-snowflake]
+Columns: transaction_id, timestamp, sender_account, receiver_account,
+         amount, bank, pattern_label
+
+Run: PYTHONPATH=backend python -m data_simulation.seed
 """
 from __future__ import annotations
 
-import argparse
-import csv
-import os
 import random
+from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 
-from data_simulation.schema import make_customer, make_account, make_device
-from data_simulation.normal_transactions import generate_normal_batch
+import pandas as pd
+
 from data_simulation.aml_patterns import (
-    generate_structuring,
-    generate_layering,
     generate_circular,
-    generate_mule,
     generate_dormant_activation,
+    generate_layering,
+    generate_mule,
     generate_rapid_multihop,
+    generate_structuring,
 )
-from core.logging import configure_logging, get_logger
+from data_simulation.normal_transactions import generate_normal_batch
+from data_simulation.schema import PATTERN_LABELS, TX_COLUMNS, make_account
 
-configure_logging()
-log = get_logger(__name__)
-
-DATA_DIR = Path(__file__).parent.parent.parent / "data"
-
-ACCOUNT_COLUMNS = [
-    "id", "customer_id", "account_type", "bank_code", "country",
-    "risk_tier", "created_at", "is_dormant", "dormant_since",
-]
-TX_COLUMNS = [
-    "id", "sender_account_id", "receiver_account_id", "amount", "currency",
-    "transaction_type", "channel", "device_id", "merchant_id", "ip_address",
-    "geo_lat", "geo_lon", "timestamp", "is_flagged", "aml_label",
-]
+DATA_DIR = Path(__file__).resolve().parent.parent.parent / "data"
 
 
-def _write_csv(path: Path, rows: list[dict], columns: list[str]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=columns, extrasaction="ignore")
-        writer.writeheader()
-        writer.writerows(rows)
-    log.info("CSV written", path=str(path), rows=len(rows))
+def generate_dataset(n_normal: int = 47_000) -> tuple[list[dict], list[dict]]:
+    """Build accounts + mixed transaction list targeting ~50k rows, 5–8% labeled."""
+    print("Generating accounts...")
+    accounts = [make_account(is_dormant=random.random() < 0.08) for _ in range(1_200)]
+    dormant = [a for a in accounts if a["is_dormant"]]
+    active = [a for a in accounts if not a["is_dormant"]]
+    print(f"  {len(accounts)} accounts ({len(dormant)} dormant, {len(active)} active)")
 
+    print(f"Generating {n_normal:,} normal transactions...")
+    transactions = generate_normal_batch(active, n=n_normal)
 
-def generate_dataset(n_normal: int = 40_000) -> tuple[list, list, list]:
-    log.info("Generating entities...")
-
-    # Generate 500 customers and 800 accounts
-    customers = [make_customer(risk_tier=random.choices([1, 2, 3], weights=[70, 20, 10])[0])
-                 for _ in range(500)]
-    accounts = []
-    for cust in customers:
-        n_accts = random.randint(1, 3)
-        for _ in range(n_accts):
-            accts = make_account(cust["id"], is_dormant=random.random() < 0.08)
-            accounts.append(accts)
-
-    # Separate dormant accounts for AML patterns
-    dormant_accounts = [a for a in accounts if a["is_dormant"]]
-    active_accounts = [a for a in accounts if not a["is_dormant"]]
-
-    log.info("Entities created", accounts=len(accounts), dormant=len(dormant_accounts))
-
-    # ── Normal transactions ────────────────────────────────────────────────────
-    log.info(f"Generating {n_normal:,} normal transactions...")
-    transactions = generate_normal_batch(active_accounts, n=n_normal)
-
-    # ── AML patterns ──────────────────────────────────────────────────────────
-    log.info("Generating AML patterns...")
+    print("Generating AML pattern episodes...")
     base = datetime.now(timezone.utc)
 
-    # Structuring: 50 episodes × 8 txns each = 400
-    for _ in range(50):
-        sender = random.choice(active_accounts)
-        receivers = random.sample(active_accounts, 5)
-        transactions.extend(generate_structuring(sender, receivers))
-
-    # Layering: 80 episodes × ~6 txns each = 480
-    for _ in range(80):
-        chain_accounts = random.sample(active_accounts, 7)
-        transactions.extend(generate_layering(chain_accounts, n_hops=random.randint(4, 7)))
-
-    # Circular flows: 60 episodes × ~4 txns each = 240
+    # Structuring: 60 × 8 ≈ 480
     for _ in range(60):
-        ring = random.sample(active_accounts, 4)
-        transactions.extend(generate_circular(ring))
+        sender = random.choice(active)
+        receivers = random.sample(active, min(5, len(active)))
+        transactions.extend(generate_structuring(sender, receivers, base_time=base))
 
-    # Mule accounts: 40 episodes × ~13 txns each = 520
-    for _ in range(40):
-        mule = random.choice(active_accounts)
-        senders = random.sample(active_accounts, 10)
-        dest = random.choice(active_accounts)
-        transactions.extend(generate_mule(mule, senders, dest))
+    # Layering: 120 × ~6 ≈ 720
+    for _ in range(120):
+        chain = random.sample(active, min(9, len(active)))
+        transactions.extend(
+            generate_layering(chain, base_time=base, n_hops=random.randint(4, 8))
+        )
 
-    # Dormant activation: 30 episodes × 5 txns each = 150
-    if dormant_accounts:
-        for _ in range(min(30, len(dormant_accounts))):
-            dormant = random.choice(dormant_accounts)
-            receivers = random.sample(active_accounts, 5)
-            transactions.extend(generate_dormant_activation(dormant, receivers))
+    # Circular: 100 × 3 ≈ 300
+    for _ in range(100):
+        ring = random.sample(active, min(4, len(active)))
+        transactions.extend(generate_circular(ring, base_time=base))
 
-    # Rapid multihop: 60 episodes × ~6 txns each = 360
-    for _ in range(60):
-        chain = random.sample(active_accounts, 7)
-        transactions.extend(generate_rapid_multihop(chain))
+    # Mule: 55 × ~13 ≈ 715
+    for _ in range(55):
+        mule = random.choice(active)
+        senders = random.sample([a for a in active if a["id"] != mule["id"]], 12)
+        dest = random.choice([a for a in active if a["id"] != mule["id"]])
+        transactions.extend(generate_mule(mule, senders, dest, base_time=base))
 
-    log.info("Dataset generated",
-             total_transactions=len(transactions),
-             fraud_transactions=sum(1 for t in transactions if t["is_flagged"]))
+    # Dormant activation: up to 45 × 5 ≈ 225
+    if dormant:
+        for _ in range(min(45, len(dormant))):
+            d = random.choice(dormant)
+            receivers = random.sample(active, min(5, len(active)))
+            transactions.extend(generate_dormant_activation(d, receivers, base_time=base))
 
-    return customers, accounts, transactions
+    # Rapid multi-hop: 90 × ~6 ≈ 540
+    for _ in range(90):
+        chain = random.sample(active, min(7, len(active)))
+        transactions.extend(generate_rapid_multihop(chain, base_time=base))
+
+    return accounts, transactions
 
 
-def seed(load_snowflake: bool = True) -> None:
-    customers, accounts, transactions = generate_dataset()
+def _print_distribution(df: pd.DataFrame) -> None:
+    total = len(df)
+    labeled = df["pattern_label"].notna() & (df["pattern_label"].astype(str).str.len() > 0)
+    flagged = int(labeled.sum())
+    rate = 100.0 * flagged / total if total else 0.0
 
-    # Write CSVs
-    _write_csv(DATA_DIR / "customers.csv", customers,
-               ["id", "name", "email", "phone", "country", "risk_tier", "kyc_verified"])
-    _write_csv(DATA_DIR / "accounts.csv", accounts, ACCOUNT_COLUMNS)
-    _write_csv(DATA_DIR / "transactions.csv", transactions, TX_COLUMNS)
+    print("\n── Dataset summary ──────────────────────────────────────")
+    print(f"  Total transactions : {total:,}")
+    print(f"  Flagged (labeled)  : {flagged:,} ({rate:.2f}%)")
+    print(f"  Clean              : {total - flagged:,}")
+    print("\n  Pattern distribution:")
+    counts = Counter(df.loc[labeled, "pattern_label"].tolist())
+    for label in PATTERN_LABELS:
+        print(f"    {label:20s} {counts.get(label, 0):>6,}")
+    missing = [lab for lab in PATTERN_LABELS if counts.get(lab, 0) == 0]
+    if missing:
+        print(f"\n  WARNING: missing labels: {missing}")
+    if not (5.0 <= rate <= 8.0):
+        print(f"\n  WARNING: flagged rate {rate:.2f}% outside target band 5–8%")
+    else:
+        print(f"\n  Flagged rate within target band (5–8%).")
+    print("────────────────────────────────────────────────────────\n")
 
-    if not load_snowflake:
-        log.info("Snowflake load skipped (--no-snowflake)")
-        return
 
-    log.info("Loading data into Snowflake via COPY INTO...")
-    try:
-        from db.snowflake.session import get_engine
-        engine = get_engine()
-        if engine is None:
-            log.warning("Snowflake not configured — data saved to CSV only")
-            return
+def seed() -> Path:
+    _, transactions = generate_dataset()
+    df = pd.DataFrame(transactions)[TX_COLUMNS]
+    # Normalize empty labels to pandas NA for clean CSV nulls
+    df["pattern_label"] = df["pattern_label"].where(
+        df["pattern_label"].notna() & (df["pattern_label"].astype(str).str.len() > 0),
+        other=pd.NA,
+    )
+    df = df.sort_values("timestamp").reset_index(drop=True)
 
-        with engine.connect() as conn:
-            for table, csv_path in [
-                ("accounts", DATA_DIR / "accounts.csv"),
-                ("transactions", DATA_DIR / "transactions.csv"),
-            ]:
-                conn.execute(f"PUT file://{csv_path.resolve()} @aml_stage AUTO_COMPRESS=TRUE OVERWRITE=TRUE")
-                conn.execute(
-                    f"COPY INTO {table} FROM @aml_stage/{csv_path.name}.gz "
-                    "FILE_FORMAT=(TYPE=CSV FIELD_OPTIONALLY_ENCLOSED_BY='\"' SKIP_HEADER=1 NULL_IF=('NULL','null','')) "
-                    "ON_ERROR=CONTINUE PURGE=TRUE"
-                )
-                log.info(f"Loaded {table} into Snowflake")
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    out = DATA_DIR / "transactions.csv"
+    df.to_csv(out, index=False)
 
-    except Exception as exc:
-        log.error("Snowflake load failed — data available in CSV", error=str(exc))
+    _print_distribution(df)
+    print(f"Wrote {len(df):,} rows → {out}")
+    return out
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Seed AML dataset")
-    parser.add_argument("--no-snowflake", action="store_true",
-                        help="Skip Snowflake load — CSV output only")
-    args = parser.parse_args()
-    seed(load_snowflake=not args.no_snowflake)
+    seed()

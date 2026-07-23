@@ -1,7 +1,5 @@
-version: "3.9"
-
 services:
-  # ── Redis (hot path cache + feature store) ───────────────────────────────
+  # ── Redis 7 (hot-path velocity cache) ───────────────────────────────────────
   redis:
     image: redis:7-alpine
     command: redis-server --save "" --appendonly no
@@ -12,43 +10,49 @@ services:
       interval: 5s
       timeout: 3s
       retries: 5
-    networks: [aml-net]
+    networks: [aml-network]
 
-  # ── Kafka (KRaft mode — no Zookeeper required) ───────────────────────────
+  # ── Kafka (Confluent cp-kafka 7.6.1, KRaft, no Zookeeper) ───────────────────
   kafka:
-    image: bitnami/kafka:3.7
+    image: confluentinc/cp-kafka:7.6.1
+    hostname: kafka
     environment:
-      KAFKA_CFG_NODE_ID: 1
-      KAFKA_CFG_PROCESS_ROLES: broker,controller
-      KAFKA_CFG_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
-      KAFKA_CFG_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
-      KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT
-      KAFKA_CFG_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
-      KAFKA_CFG_CONTROLLER_LISTENER_NAMES: CONTROLLER
-      KAFKA_CFG_AUTO_CREATE_TOPICS_ENABLE: "true"
-      KAFKA_CFG_NUM_PARTITIONS: 4
-      KAFKA_CFG_DEFAULT_REPLICATION_FACTOR: 1
-      KAFKA_CFG_LOG_RETENTION_HOURS: 168
+      CLUSTER_ID: ylKFFFIyR7WnD_SMOjYH6g
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_NUM_PARTITIONS: 4
+      KAFKA_LOG_RETENTION_HOURS: 168
     ports:
       - "9092:9092"
     healthcheck:
-      test: ["CMD-SHELL", "kafka-topics.sh --bootstrap-server localhost:9092 --list"]
+      test: ["CMD-SHELL", "kafka-topics --bootstrap-server localhost:9092 --list"]
       interval: 15s
       timeout: 10s
       retries: 5
-      start_period: 30s
-    networks: [aml-net]
+      start_period: 40s
+    networks: [aml-network]
 
-  # ── Neo4j with GDS plugin ─────────────────────────────────────────────────
+  # ── Neo4j 5 + Graph Data Science plugin ─────────────────────────────────────
   neo4j:
     image: neo4j:5.18-enterprise
     environment:
-      NEO4J_AUTH: neo4j/${NEO4J_PASSWORD:-password}
+      NEO4J_AUTH: neo4j/password
       NEO4J_PLUGINS: '["graph-data-science"]'
+      NEO4J_ACCEPT_LICENSE_AGREEMENT: "yes"
       NEO4J_dbms_memory_heap_initial__size: 512m
       NEO4J_dbms_memory_heap_max__size: 2G
       NEO4J_dbms_memory_pagecache_size: 512m
-      NEO4J_ACCEPT_LICENSE_AGREEMENT: "yes"
     ports:
       - "7474:7474"
       - "7687:7687"
@@ -61,64 +65,12 @@ services:
       timeout: 10s
       retries: 5
       start_period: 60s
-    networks: [aml-net]
-
-  # ── FastAPI Backend ───────────────────────────────────────────────────────
-  backend:
-    build:
-      context: ..
-      dockerfile: docker/Dockerfile.backend
-    depends_on:
-      redis:
-        condition: service_healthy
-      kafka:
-        condition: service_healthy
-      neo4j:
-        condition: service_healthy
-    env_file: ../.env
-    ports:
-      - "8000:8000"
-    volumes:
-      - ../data:/app/data
-    networks: [aml-net]
-    restart: unless-stopped
-
-  # ── Kafka Consumers ───────────────────────────────────────────────────────
-  consumers:
-    build:
-      context: ..
-      dockerfile: docker/Dockerfile.backend
-    depends_on:
-      redis:
-        condition: service_healthy
-      kafka:
-        condition: service_healthy
-      neo4j:
-        condition: service_healthy
-    env_file: ../.env
-    volumes:
-      - ../data:/app/data
-    command: ["python", "-m", "kafka.consumers.runner"]
-    networks: [aml-net]
-    restart: unless-stopped
-
-  # ── Streamlit Dashboard ───────────────────────────────────────────────────
-  dashboard:
-    build:
-      context: ..
-      dockerfile: docker/Dockerfile.dashboard
-    depends_on:
-      - backend
-    env_file: ../.env
-    ports:
-      - "8501:8501"
-    networks: [aml-net]
-    restart: unless-stopped
+    networks: [aml-network]
 
 volumes:
   neo4jdata:
   neo4jlogs:
 
 networks:
-  aml-net:
+  aml-network:
     driver: bridge

@@ -1,25 +1,34 @@
-"""Topic name constants and message schema definitions."""
+"""Kafka topic helpers — ensure transactions.raw exists on startup."""
+from __future__ import annotations
+
+from confluent_kafka.admin import AdminClient, NewTopic
+
 from core.config import settings
 
-TX_RAW = settings.kafka_topic_tx_raw         # "transactions.raw"
-TX_SCORED = settings.kafka_topic_tx_scored   # "transactions.scored"
-TX_FLAGGED = settings.kafka_topic_tx_flagged # "transactions.flagged"
-RISK_ALERTS = settings.kafka_topic_risk_alerts
-SAR_REQUESTS = settings.kafka_topic_sar_requests
-
-ALL_TOPICS = [TX_RAW, TX_SCORED, TX_FLAGGED, RISK_ALERTS, SAR_REQUESTS]
-
-# Risk tier thresholds
-THRESHOLD_MEDIUM = 30.0
-THRESHOLD_HIGH = 70.0
-THRESHOLD_CRITICAL = 90.0
+TX_RAW = settings.kafka_topic_tx_raw
 
 
-def classify_risk_tier(composite_score: float) -> str:
-    if composite_score >= THRESHOLD_CRITICAL:
-        return "CRITICAL"
-    if composite_score >= THRESHOLD_HIGH:
-        return "HIGH"
-    if composite_score >= THRESHOLD_MEDIUM:
-        return "MEDIUM"
-    return "LOW"
+def ensure_topics(
+    bootstrap_servers: str | None = None,
+    partitions: int = 4,
+    replication_factor: int = 1,
+) -> None:
+    """Create transactions.raw if missing (4 partitions, RF=1)."""
+    servers = bootstrap_servers or settings.kafka_bootstrap_servers
+    admin = AdminClient({"bootstrap.servers": servers})
+    topic = NewTopic(
+        TX_RAW,
+        num_partitions=partitions,
+        replication_factor=replication_factor,
+    )
+    futures = admin.create_topics([topic])
+    for name, future in futures.items():
+        try:
+            future.result()
+            print(f"Created topic: {name} (partitions={partitions}, rf={replication_factor})")
+        except Exception as exc:
+            # TopicAlreadyExistsError is fine
+            if "already exists" in str(exc).lower() or "TOPIC_ALREADY_EXISTS" in str(exc):
+                print(f"Topic already exists: {name}")
+            else:
+                raise

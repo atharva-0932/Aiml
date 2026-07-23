@@ -1,7 +1,8 @@
 """
-AML pattern simulation.
-Each function generates a cluster of transactions implementing a specific
-money laundering typology as understood by FATF and FinCEN guidance.
+AML pattern generators with ground-truth pattern_label values.
+
+Each function returns a cluster of transactions implementing one typology
+(FATF / FinCEN style). Labels match the Phase 1 CSV schema.
 """
 from __future__ import annotations
 
@@ -9,301 +10,166 @@ import random
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from data_simulation.schema import new_id, CHANNELS, CURRENCIES
+from data_simulation.schema import make_transaction
 
 
-def _ts(base: datetime, offset_minutes: int) -> str:
-    return (base + timedelta(minutes=offset_minutes)).isoformat()
+def _offset(base: datetime, minutes: int) -> datetime:
+    return base + timedelta(minutes=minutes)
 
 
-# ── 1. Structuring (smurfing) ──────────────────────────────────────────────────
+# ── 1. Structuring ────────────────────────────────────────────────────────────
 
 def generate_structuring(
-    sender: dict,
-    receivers: list[dict],
+    sender: dict[str, Any],
+    receivers: list[dict[str, Any]],
     base_time: datetime | None = None,
     n_transactions: int = 8,
-) -> list[dict]:
-    """
-    Multiple transactions just below the $10,000 CTR threshold
-    from the same sender within 24–48 hours.
-    """
+) -> list[dict[str, Any]]:
+    """Multiple payments just below the $10,000 CTR threshold within 24–48h."""
     base = base_time or datetime.now(timezone.utc)
-    txns = []
-    for i in range(n_transactions):
+    txns: list[dict[str, Any]] = []
+    for _ in range(n_transactions):
         amount = round(random.uniform(8_500, 9_999), 2)
         receiver = random.choice(receivers)
-        txns.append({
-            "id": new_id(),
-            "sender_account_id": sender["id"],
-            "receiver_account_id": receiver["id"],
-            "amount": amount,
-            "currency": "USD",
-            "transaction_type": "cash_deposit",
-            "channel": random.choice(["branch", "ATM"]),
-            "device_id": None,
-            "merchant_id": None,
-            "ip_address": None,
-            "geo_lat": round(random.uniform(30, 45), 5),
-            "geo_lon": round(random.uniform(-100, -70), 5),
-            "timestamp": _ts(base, random.randint(0, 2880)),
-            "is_flagged": True,
-            "aml_label": "structuring",
-            "bank_code": sender.get("bank_code", ""),
-            "country": "US",
-            "dormant_flag": 0,
-            "device_switch_flag": 0,
-            "pagerank_score": 0.1,
-            "graph_in_degree": 1,
-            "graph_out_degree": n_transactions,
-            "cycle_membership": 0,
-            "hop_depth": 1,
-        })
+        ts = _offset(base, random.randint(0, 2_880))
+        txns.append(make_transaction(sender, receiver, amount, ts, "structuring"))
     return txns
 
 
-# ── 2. Layering ────────────────────────────────────────────────────────────────
+# ── 2. Layering ───────────────────────────────────────────────────────────────
 
 def generate_layering(
-    accounts: list[dict],
+    accounts: list[dict[str, Any]],
     base_time: datetime | None = None,
     n_hops: int = 6,
-) -> list[dict]:
-    """
-    Chain A→B→C→D→E→F over 3–7 hops. Amounts reduce by ~15% per hop
-    to simulate fee extraction and obfuscation.
-    """
+) -> list[dict[str, Any]]:
+    """4–8 hop chain; amounts decay ~15%/hop; prefer cross-bank hops."""
     base = base_time or datetime.now(timezone.utc)
+    n_hops = max(4, min(n_hops, 8))
     chain = random.sample(accounts, min(n_hops + 1, len(accounts)))
-    txns = []
-    amount = round(random.uniform(50_000, 500_000), 2)
 
+    # Prefer distinct banks along the chain when possible
+    banks = {a["bank"] for a in chain}
+    if len(banks) < 2 and len(accounts) >= n_hops + 1:
+        by_bank: dict[str, list] = {}
+        for a in accounts:
+            by_bank.setdefault(a["bank"], []).append(a)
+        if len(by_bank) >= 2:
+            picks: list[dict] = []
+            bank_cycle = list(by_bank.keys())
+            for i in range(n_hops + 1):
+                pool = by_bank[bank_cycle[i % len(bank_cycle)]]
+                picks.append(random.choice(pool))
+            chain = picks
+
+    txns: list[dict[str, Any]] = []
+    amount = round(random.uniform(50_000, 500_000), 2)
     for i in range(len(chain) - 1):
         amount = round(amount * random.uniform(0.83, 0.94), 2)
-        txns.append({
-            "id": new_id(),
-            "sender_account_id": chain[i]["id"],
-            "receiver_account_id": chain[i + 1]["id"],
-            "amount": amount,
-            "currency": random.choice(CURRENCIES),
-            "transaction_type": random.choice(["wire", "SWIFT"]),
-            "channel": "online",
-            "device_id": None,
-            "merchant_id": None,
-            "ip_address": None,
-            "geo_lat": round(random.uniform(-70, 70), 5),
-            "geo_lon": round(random.uniform(-170, 170), 5),
-            "timestamp": _ts(base, i * random.randint(60, 360)),
-            "is_flagged": True,
-            "aml_label": "layering",
-            "bank_code": chain[i].get("bank_code", "ANON"),
-            "country": chain[i].get("country", "US"),
-            "dormant_flag": 0,
-            "device_switch_flag": 0,
-            "pagerank_score": 0.05 * (i + 1),
-            "graph_in_degree": i,
-            "graph_out_degree": 1,
-            "cycle_membership": 0,
-            "hop_depth": i + 1,
-        })
+        ts = _offset(base, i * random.randint(60, 360))
+        txns.append(make_transaction(chain[i], chain[i + 1], amount, ts, "layering"))
     return txns
 
 
-# ── 3. Circular fund transfer ──────────────────────────────────────────────────
+# ── 3. Circular fund flow ─────────────────────────────────────────────────────
 
 def generate_circular(
-    accounts: list[dict],
+    accounts: list[dict[str, Any]],
     base_time: datetime | None = None,
-) -> list[dict]:
-    """A→B→C→A within 72 hours. Classic integration typology."""
+) -> list[dict[str, Any]]:
+    """A → B → C → A within 72 hours."""
     base = base_time or datetime.now(timezone.utc)
-    ring = random.sample(accounts, min(4, len(accounts)))
-    ring.append(ring[0])  # close the cycle
+    ring = random.sample(accounts, min(3, len(accounts)))
+    if len(ring) < 3:
+        return []
+    ring = ring + [ring[0]]
     amount = round(random.uniform(10_000, 200_000), 2)
-    txns = []
-
+    txns: list[dict[str, Any]] = []
+    # Spread hops across < 72h (4320 minutes)
     for i in range(len(ring) - 1):
-        txns.append({
-            "id": new_id(),
-            "sender_account_id": ring[i]["id"],
-            "receiver_account_id": ring[i + 1]["id"],
-            "amount": round(amount * random.uniform(0.97, 1.03), 2),
-            "currency": "USD",
-            "transaction_type": "wire",
-            "channel": "online",
-            "device_id": None,
-            "merchant_id": None,
-            "ip_address": None,
-            "geo_lat": round(random.uniform(-70, 70), 5),
-            "geo_lon": round(random.uniform(-170, 170), 5),
-            "timestamp": _ts(base, i * random.randint(120, 720)),
-            "is_flagged": True,
-            "aml_label": "circular_flow",
-            "bank_code": ring[i].get("bank_code", ""),
-            "country": ring[i].get("country", "US"),
-            "dormant_flag": 0,
-            "device_switch_flag": 0,
-            "pagerank_score": 0.3,
-            "graph_in_degree": 1,
-            "graph_out_degree": 1,
-            "cycle_membership": 1,
-            "hop_depth": i + 1,
-        })
+        hop_amount = round(amount * random.uniform(0.97, 1.03), 2)
+        ts = _offset(base, i * random.randint(120, 1_200))
+        txns.append(make_transaction(ring[i], ring[i + 1], hop_amount, ts, "circular_flow"))
     return txns
 
 
-# ── 4. Mule account ────────────────────────────────────────────────────────────
+# ── 4. Mule accounts ──────────────────────────────────────────────────────────
 
 def generate_mule(
-    mule_account: dict,
-    senders: list[dict],
-    final_destination: dict,
+    mule_account: dict[str, Any],
+    senders: list[dict[str, Any]],
+    final_destination: dict[str, Any],
     base_time: datetime | None = None,
-) -> list[dict]:
-    """
-    Mule receives many small deposits, then forwards 90%+ to single destination.
-    """
+) -> list[dict[str, Any]]:
+    """Fan-in from 10+ sources, then ~92% forwarded to one destination."""
     base = base_time or datetime.now(timezone.utc)
-    txns = []
-    total_in = 0.0
+    sources = senders[:12] if len(senders) >= 10 else senders
+    if len(sources) < 10:
+        return []
 
-    for i, sender in enumerate(senders[:12]):
+    txns: list[dict[str, Any]] = []
+    total_in = 0.0
+    for i, sender in enumerate(sources):
         amount = round(random.uniform(1_000, 8_000), 2)
         total_in += amount
-        txns.append({
-            "id": new_id(),
-            "sender_account_id": sender["id"],
-            "receiver_account_id": mule_account["id"],
-            "amount": amount,
-            "currency": "USD",
-            "transaction_type": "ACH",
-            "channel": "mobile",
-            "device_id": None,
-            "merchant_id": None,
-            "ip_address": None,
-            "geo_lat": round(random.uniform(30, 45), 5),
-            "geo_lon": round(random.uniform(-100, -70), 5),
-            "timestamp": _ts(base, i * 60),
-            "is_flagged": True,
-            "aml_label": "mule",
-            "bank_code": mule_account.get("bank_code", ""),
-            "country": "US",
-            "dormant_flag": 0,
-            "device_switch_flag": 0,
-            "pagerank_score": 0.5,
-            "graph_in_degree": i + 1,
-            "graph_out_degree": 1,
-            "cycle_membership": 0,
-            "hop_depth": 1,
-        })
+        ts = _offset(base, i * 60)
+        txns.append(make_transaction(sender, mule_account, amount, ts, "mule"))
 
-    # Consolidation transfer — 92% of total collected
-    txns.append({
-        "id": new_id(),
-        "sender_account_id": mule_account["id"],
-        "receiver_account_id": final_destination["id"],
-        "amount": round(total_in * 0.92, 2),
-        "currency": "USD",
-        "transaction_type": "wire",
-        "channel": "online",
-        "device_id": None,
-        "merchant_id": None,
-        "ip_address": None,
-        "geo_lat": round(random.uniform(-70, 70), 5),
-        "geo_lon": round(random.uniform(-170, 170), 5),
-        "timestamp": _ts(base, len(senders) * 60 + 30),
-        "is_flagged": True,
-        "aml_label": "mule",
-        "bank_code": mule_account.get("bank_code", ""),
-        "country": "US",
-        "dormant_flag": 0,
-        "device_switch_flag": 0,
-        "pagerank_score": 0.6,
-        "graph_in_degree": len(senders),
-        "graph_out_degree": 1,
-        "cycle_membership": 0,
-        "hop_depth": 2,
-    })
+    out_amount = round(total_in * 0.92, 2)
+    ts_out = _offset(base, len(sources) * 60 + 30)
+    txns.append(make_transaction(mule_account, final_destination, out_amount, ts_out, "mule"))
     return txns
 
 
-# ── 5. Dormant activation ──────────────────────────────────────────────────────
+# ── 5. Dormant activation ─────────────────────────────────────────────────────
 
 def generate_dormant_activation(
-    dormant_account: dict,
-    receivers: list[dict],
+    dormant_account: dict[str, Any],
+    receivers: list[dict[str, Any]],
     base_time: datetime | None = None,
-) -> list[dict]:
-    """Account silent >180 days, then sudden high-value activity."""
+) -> list[dict[str, Any]]:
+    """Account silent 180+ days, then sudden high-value activity."""
     base = base_time or datetime.now(timezone.utc)
-    txns = []
+    # Anchor: last "activity" was 180+ days ago (metadata only; burst is current)
+    dormant_since = dormant_account.get("dormant_since") or (base - timedelta(days=200))
+    if isinstance(dormant_since, str):
+        dormant_since = datetime.fromisoformat(dormant_since)
+    if dormant_since.tzinfo is None:
+        dormant_since = dormant_since.replace(tzinfo=timezone.utc)
+
+    silence_days = (base - dormant_since).days
+    if silence_days < 180:
+        base = dormant_since + timedelta(days=185)
+
+    txns: list[dict[str, Any]] = []
     for i, receiver in enumerate(receivers[:5]):
-        txns.append({
-            "id": new_id(),
-            "sender_account_id": dormant_account["id"],
-            "receiver_account_id": receiver["id"],
-            "amount": round(random.uniform(20_000, 150_000), 2),
-            "currency": random.choice(CURRENCIES),
-            "transaction_type": "wire",
-            "channel": "online",
-            "device_id": None,
-            "merchant_id": None,
-            "ip_address": None,
-            "geo_lat": round(random.uniform(-70, 70), 5),
-            "geo_lon": round(random.uniform(-170, 170), 5),
-            "timestamp": _ts(base, i * 30),
-            "is_flagged": True,
-            "aml_label": "dormant_activation",
-            "bank_code": dormant_account.get("bank_code", ""),
-            "country": dormant_account.get("country", "US"),
-            "dormant_flag": 1,
-            "device_switch_flag": 1,
-            "pagerank_score": 0.15,
-            "graph_in_degree": 0,
-            "graph_out_degree": i + 1,
-            "cycle_membership": 0,
-            "hop_depth": 1,
-        })
+        amount = round(random.uniform(20_000, 150_000), 2)
+        ts = _offset(base, i * 30)
+        txns.append(
+            make_transaction(dormant_account, receiver, amount, ts, "dormant_activation")
+        )
     return txns
 
 
-# ── 6. Rapid multi-hop ─────────────────────────────────────────────────────────
+# ── 6. Rapid multi-hop ────────────────────────────────────────────────────────
 
 def generate_rapid_multihop(
-    accounts: list[dict],
+    accounts: list[dict[str, Any]],
     base_time: datetime | None = None,
-) -> list[dict]:
+) -> list[dict[str, Any]]:
     """5+ transfers across 5+ accounts within 2 hours."""
     base = base_time or datetime.now(timezone.utc)
     chain = random.sample(accounts, min(7, len(accounts)))
-    amount = round(random.uniform(5_000, 100_000), 2)
-    txns = []
+    if len(chain) < 6:
+        return []
 
+    amount = round(random.uniform(5_000, 100_000), 2)
+    txns: list[dict[str, Any]] = []
+    # Total span: at most 120 minutes
     for i in range(len(chain) - 1):
-        txns.append({
-            "id": new_id(),
-            "sender_account_id": chain[i]["id"],
-            "receiver_account_id": chain[i + 1]["id"],
-            "amount": round(amount * random.uniform(0.95, 1.02), 2),
-            "currency": "USD",
-            "transaction_type": "wire",
-            "channel": "API",
-            "device_id": None,
-            "merchant_id": None,
-            "ip_address": None,
-            "geo_lat": round(random.uniform(-70, 70), 5),
-            "geo_lon": round(random.uniform(-170, 170), 5),
-            "timestamp": _ts(base, i * random.randint(5, 20)),
-            "is_flagged": True,
-            "aml_label": "rapid_multihop",
-            "bank_code": chain[i].get("bank_code", ""),
-            "country": chain[i].get("country", "US"),
-            "dormant_flag": 0,
-            "device_switch_flag": 0,
-            "pagerank_score": 0.2,
-            "graph_in_degree": i,
-            "graph_out_degree": 1,
-            "cycle_membership": 0,
-            "hop_depth": i + 1,
-        })
+        hop_amount = round(amount * random.uniform(0.95, 1.02), 2)
+        ts = _offset(base, i * random.randint(5, 18))
+        txns.append(
+            make_transaction(chain[i], chain[i + 1], hop_amount, ts, "rapid_multihop")
+        )
     return txns
