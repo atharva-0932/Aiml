@@ -20,6 +20,7 @@ async def detect_cycles(session: AsyncSession, account_id: str) -> list[dict[str
         WITH path, length(path) AS hop_count,
              [n IN nodes(path) | n.id] AS account_ids
         RETURN hop_count, account_ids
+        LIMIT 50
         """,
         account_id=account_id,
     )
@@ -87,7 +88,7 @@ async def detect_layering(session: AsyncSession, account_id: str) -> list[dict[s
     """
     result = await session.run(
         """
-        MATCH path = (a:Account {id: $account_id})-[rels:TRANSFER*4..8]->(end:Account)
+        MATCH path = (a:Account {id: $account_id})-[rels:TRANSFER*4..6]->(end:Account)
         WITH length(path) AS chain_length,
              [r IN relationships(path) | coalesce(r.bank, '')] AS banks
         WITH chain_length, banks,
@@ -99,6 +100,7 @@ async def detect_layering(session: AsyncSession, account_id: str) -> list[dict[s
         WHERE size(unique_banks) >= 2
         RETURN DISTINCT chain_length, unique_banks AS banks
         ORDER BY chain_length DESC
+        LIMIT 25
         """,
         account_id=account_id,
     )
@@ -113,41 +115,17 @@ async def detect_layering(session: AsyncSession, account_id: str) -> list[dict[s
 
 async def get_pagerank(session: AsyncSession, account_id: str) -> float:
     """
-    PageRank via GDS. Tries anonymous nodeQuery/relationshipQuery stream first,
-    then falls back to project.cypher + stream + drop.
+    PageRank via GDS native projection (Account / TRANSFER), then stream.
     Returns 0.0 if account missing or GDS unavailable.
     """
-    try:
-        result = await session.run(
-            """
-            CALL gds.pageRank.stream({
-              nodeQuery: 'MATCH (a:Account) RETURN id(a) AS id',
-              relationshipQuery: 'MATCH (a:Account)-[:TRANSFER]->(b:Account)
-                                  RETURN id(a) AS source, id(b) AS target'
-            })
-            YIELD nodeId, score
-            WITH gds.util.asNode(nodeId) AS n, score
-            WHERE n.id = $account_id
-            RETURN score
-            LIMIT 1
-            """,
-            account_id=account_id,
-        )
-        record = await result.single()
-        return float(record["score"]) if record is not None else 0.0
-    except Exception:
-        pass
-
     graph_name = f"aml_pr_{abs(hash(account_id)) % 10_000_000}"
     try:
         create = await session.run(
             """
-            CALL gds.graph.project.cypher(
+            CALL gds.graph.project(
               $graph_name,
-              'MATCH (a:Account) RETURN id(a) AS id',
-              'MATCH (a:Account)-[:TRANSFER]->(b:Account)
-               RETURN id(a) AS source, id(b) AS target',
-              {validateRelationships: false}
+              'Account',
+              'TRANSFER'
             )
             YIELD graphName
             RETURN graphName

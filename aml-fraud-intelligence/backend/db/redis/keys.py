@@ -25,5 +25,13 @@ def graph_risk(account_id: str) -> str:
     return f"graph_risk:{account_id}"
 
 
+def shap(transaction_id: str) -> str:
+    return f"shap:{transaction_id}"
+
+
+def alert(transaction_id: str) -> str:
+    return f"alert:{transaction_id}"
+
+
 TTL_1H = 3600
 TTL_24H = 86400

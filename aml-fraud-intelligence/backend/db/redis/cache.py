@@ -1,5 +1,5 @@
 """
-Velocity counters + risk / graph score cache for the ml_scorer consumer.
+Velocity counters + risk / graph / SHAP / alert cache for ml_scorer + API.
 """
 from __future__ import annotations
 
@@ -37,13 +37,6 @@ async def get_velocity_features(account_id: str) -> dict[str, float]:
 
 
 async def update_velocity(sender_account: str, receiver_account: str, amount: float) -> None:
-    """
-    Update sliding-window velocity after scoring:
-      INCR tx_count:{sender}:1h → EXPIRE 3600
-      INCRBYFLOAT tx_volume:{sender}:1h → EXPIRE 3600
-      SADD unique_receivers:{sender}:24h {receiver} → EXPIRE 86400
-      SET last_tx_ts:{sender} = now
-    """
     r = get_redis()
     pipe = r.pipeline()
     pipe.incr(K.tx_count_1h(sender_account))
@@ -57,9 +50,19 @@ async def update_velocity(sender_account: str, receiver_account: str, amount: fl
 
 
 async def cache_risk_score(transaction_id: str, score: float) -> None:
-    """Write risk_score:{transaction_id} with 24h TTL."""
     r = get_redis()
     await r.setex(K.risk_score(transaction_id), K.TTL_24H, str(score))
+
+
+async def get_risk_score(transaction_id: str) -> float | None:
+    r = get_redis()
+    raw = await r.get(K.risk_score(transaction_id))
+    if raw is None:
+        return None
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return None
 
 
 async def get_cached_graph_risk(account_id: str) -> dict[str, Any] | None:
@@ -74,6 +77,71 @@ async def get_cached_graph_risk(account_id: str) -> dict[str, Any] | None:
 
 
 async def cache_graph_risk(account_id: str, payload: dict[str, Any]) -> None:
-    """Cache graph risk profile for 1 hour to avoid hammering Neo4j."""
     r = get_redis()
     await r.setex(K.graph_risk(account_id), K.TTL_1H, json.dumps(payload))
+
+
+async def cache_shap(transaction_id: str, shap_top: list[tuple[str, float]]) -> None:
+    """Store top SHAP features as JSON list of {feature, value}."""
+    r = get_redis()
+    payload = [{"feature": name, "value": float(val)} for name, val in shap_top]
+    await r.setex(K.shap(transaction_id), K.TTL_24H, json.dumps(payload))
+
+
+async def get_shap(transaction_id: str) -> list[dict[str, Any]]:
+    r = get_redis()
+    raw = await r.get(K.shap(transaction_id))
+    if not raw:
+        return []
+    try:
+        data = json.loads(raw)
+        return data if isinstance(data, list) else []
+    except json.JSONDecodeError:
+        return []
+
+
+async def cache_alert(
+    transaction_id: str,
+    composite_score: float,
+    tier: str,
+    pattern: str | None,
+) -> None:
+    """Write alert:{tx_id} when composite_score > 70 (TTL 24h)."""
+    r = get_redis()
+    payload = {
+        "composite_score": float(composite_score),
+        "tier": tier,
+        "pattern": pattern,
+    }
+    await r.setex(K.alert(transaction_id), K.TTL_24H, json.dumps(payload))
+
+
+async def scan_keys(pattern: str) -> list[str]:
+    """SCAN all keys matching pattern."""
+    r = get_redis()
+    keys: list[str] = []
+    cursor = 0
+    while True:
+        cursor, batch = await r.scan(cursor=cursor, match=pattern, count=500)
+        keys.extend(batch)
+        if cursor == 0:
+            break
+    return keys
+
+
+async def get_alert(transaction_id: str) -> dict[str, Any] | None:
+    r = get_redis()
+    raw = await r.get(K.alert(transaction_id))
+    if not raw:
+        return None
+    try:
+        data = json.loads(raw)
+        # Back-compat: plain float string
+        if not isinstance(data, dict):
+            return {"composite_score": float(data), "tier": None, "pattern": None}
+        return data
+    except (json.JSONDecodeError, TypeError, ValueError):
+        try:
+            return {"composite_score": float(raw), "tier": None, "pattern": None}
+        except (TypeError, ValueError):
+            return None

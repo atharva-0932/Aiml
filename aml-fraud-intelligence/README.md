@@ -8,13 +8,40 @@ analytics, and XGBoost scoring — results visualized in Streamlit.
 ## Architecture
 
 ```
-FastAPI → Kafka → [ml_scorer, graph_sync] consumers
-                     ↓               ↓
-                  Redis           Neo4j
-                     ↓
-                Supabase (cold path)
-                     ↓
-                Streamlit
+                    ┌─────────────────────────────────────────┐
+                    │           Streamlit (:8501)             │
+                    │  Overview · Explorer · Graph (PyVis)    │
+                    └──────────────────┬──────────────────────┘
+                                       │ X-API-Key
+                                       ▼
+                    ┌─────────────────────────────────────────┐
+                    │          FastAPI (:8000)                │
+                    │  /transactions  /alerts  /graph         │
+                    └──────────┬───────────────┬──────────────┘
+                               │               │
+                    ┌──────────▼──────┐   ┌────▼─────────────┐
+                    │  Redis (hot)    │   │  Neo4j + GDS     │
+                    │  risk/shap/     │   │  cycles·mule·PR  │
+                    │  alert/velocity │   └──────────────────┘
+                    └──────────▲──────┘
+                               │
+         ┌─────────────────────┴─────────────────────┐
+         │              Kafka (KRaft)                │
+         │           topic: transactions.raw         │
+         └──────▲──────────────────────▲─────────────┘
+                │                      │
+     ┌──────────┴────────┐   ┌─────────┴──────────┐
+     │  kafka.producer   │   │  ml_scorer          │
+     │  (CSV → topic)    │   │  XGBoost+Graph+SHAP │
+     └───────────────────┘   │  graph_sync→Neo4j   │
+                             └─────────┬───────────┘
+                                       │ optional
+                                       ▼
+                             ┌───────────────────┐
+                             │ Supabase (cold)   │
+                             └───────────────────┘
+
+Composite = 0.60 × XGBoost + 0.40 × Graph Risk
 ```
 
 ## Tech Stack
@@ -22,7 +49,7 @@ FastAPI → Kafka → [ml_scorer, graph_sync] consumers
 | Layer        | Technology                    |
 |--------------|-------------------------------|
 | API          | FastAPI + Uvicorn             |
-| Event Bus    | Apache Kafka 3.7 (KRaft)      |
+| Event Bus    | Apache Kafka (KRaft)          |
 | Hot Cache    | Redis 7 (hiredis)             |
 | Graph DB     | Neo4j 5 + GDS plugin          |
 | Cold Storage | Supabase (hosted Postgres)    |
@@ -46,117 +73,74 @@ Composite = 0.60 × XGBoost + 0.40 × Graph Risk
 Tiers: LOW < 30 | MEDIUM 30–70 | HIGH 70–90 | CRITICAL > 90
 ```
 
-## Build Status
+## Build Status (all phases complete)
 
 | Phase | Status |
 |-------|--------|
-| 1. Data simulation → `data/transactions.csv` | **Done** (50k rows, 6% labeled) |
-| 2. Docker Compose (kafka, redis, neo4j) | **Done** (containers healthy) |
-| 3. Kafka producer + consumers | **Done** (stub scoring) |
-| 4. Redis velocity counters | Pending (hooks live in ml_scorer) |
-| 5. Neo4j graph sync + Cypher | **Done** (queries + GraphRiskScorer + tests) |
-| 6. XGBoost + SHAP | **Done** (AUC≈0.995, composite wired into ml_scorer) |
-| 7. FastAPI endpoints | Pending |
-| 8. Supabase cold path | Pending (upsert/alerts/shap hooks live) |
-| 9. Streamlit dashboard (3 pages) | Pending |
-| 10. Unit tests | Pending |
+| 1. Data simulation → `data/transactions.csv` | **Done** (~50k rows, ~6% labeled) |
+| 2. Docker Compose (kafka, redis, neo4j) | **Done** |
+| 3. Kafka producer + consumers | **Done** |
+| 4. Neo4j graph analytics + GraphRiskScorer | **Done** |
+| 5. XGBoost + SHAP + composite scoring | **Done** |
+| 6. FastAPI (auth, transactions, alerts, graph) | **Done** |
+| 7. Streamlit dashboard (3 pages) | **Done** |
+| 8. Unit tests + cleanup | **Done** |
 
-## Phase 1 — Data Simulation
-
-Generate ~50k synthetic transactions with ground-truth AML labels.
-
-```bash
-cd aml-fraud-intelligence
-pip install -e .
-PYTHONPATH=backend python -m data_simulation.seed
-```
-
-Output: `data/transactions.csv`
-
-Columns: `transaction_id`, `timestamp`, `sender_account`, `receiver_account`,
-`amount`, `bank`, `pattern_label` (null if clean).
-
-Target: **5–8%** of rows labeled with one of the six AML patterns.
-
-## Phase 2 — Docker Compose (infra only)
-
-Services: `kafka` (KRaft :9092), `redis` (:6379), `neo4j` + GDS (:7474/:7687).
-Network: `aml-network`. No Postgres / FastAPI / Streamlit yet.
+## Quick setup
 
 ```bash
 cd aml-fraud-intelligence
 cp -n .env.example .env
-docker compose -f docker/docker-compose.yml config   # validate
-# later: docker compose -f docker/docker-compose.yml up -d
-```
+pip install -e ".[dev]"
 
-## Phase 3 — Kafka producer + consumers
+# 1) Infra
+docker compose -f docker/docker-compose.yml up -d kafka redis neo4j
 
-Topic: `transactions.raw` (4 partitions, RF=1), created on startup.
+# Host Kafka resolve (advertised as kafka:9092)
+# add to /etc/hosts:  127.0.0.1 kafka
 
-```bash
-# Install Phase 3 deps
-pip install -e .
-
-# Optional: apply Supabase migration (cold-path writes)
-# psql "$SUPABASE_DB_URL" -f backend/db/migrations/001_initial.sql
-
-# Terminal 1 — ML scorer (Redis velocity + stub score + Supabase upsert)
-PYTHONPATH=backend python3 -m kafka.consumers.ml_scorer
-
-# Terminal 2 — Graph sync (Neo4j MERGE, batch 50)
-PYTHONPATH=backend python3 -m kafka.consumers.graph_sync
-
-# Terminal 3 — Producer (streams data/transactions.csv)
-PYTHONPATH=backend python3 -m kafka.producer
-# faster smoke test: PYTHONPATH=backend python3 -m kafka.producer --delay 0
-```
-
-`.env` must use **localhost** hosts when running these scripts on the host machine
-(`KAFKA_BOOTSTRAP_SERVERS=localhost:9092`, etc.).
-
-Because Kafka advertises `PLAINTEXT://kafka:9092` inside Docker, add this line to
-`/etc/hosts` so host-side clients can resolve the broker after metadata redirect:
-
-```text
-127.0.0.1 kafka
-```
-
-## Phase 4 — Neo4j Cypher + graph risk scoring
-
-```bash
-PYTHONPATH=backend python3 -m graph.seed_fixture
-PYTHONPATH=backend python3 -m pytest tests/unit/test_graph.py -v
-```
-
-`GraphRiskScorer` returns `graph_risk` 0–100 from cycles / mule / layering / PageRank.
-Not wired into Kafka consumers yet (Phase 5).
-
-## Phase 5 — XGBoost + SHAP + composite scorer
-
-```bash
-# Re-seed if needed (AML timestamps spread across the year for temporal split)
+# 2) Seed + train (once)
 PYTHONPATH=backend python3 -m data_simulation.seed
-
-# Train
 PYTHONPATH=backend python3 -m ml.train --csv data/transactions.csv
 
-# Unit tests
-PYTHONPATH=backend python3 -m pytest tests/unit/test_ml.py -v
-
-# Full pipeline (restart ml_scorer to load the new model)
-PYTHONPATH=backend python3 -m kafka.consumers.ml_scorer
+# 3) Pipeline (separate terminals)
 PYTHONPATH=backend python3 -m kafka.consumers.graph_sync
+PYTHONPATH=backend python3 -m kafka.consumers.ml_scorer
 PYTHONPATH=backend python3 -m kafka.producer --delay 0
+
+# 4) API + dashboard
+uvicorn api.main:app --port 8000 --app-dir backend
+streamlit run dashboard/Home.py --server.port 8501
 ```
 
-Composite: `0.60 × XGBoost + 0.40 × GraphRisk`. Graph scores cached in Redis 1h.
-Artifacts: `backend/ml/models/model.json`, `feature_columns.json`, `training_metrics.json`.
+Verify:
+
+```bash
+curl -H "X-API-Key: your-secret-api-key-here" http://localhost:8000/health
+PYTHONPATH=backend python3 -m pytest tests/unit/ -v
+```
+
+## Tests
+
+```bash
+PYTHONPATH=backend python3 -m pytest tests/unit/ -v
+```
+
+Coverage: simulation CSV quality, graph Cypher/GDS, ML features/scorer, FastAPI TestClient.
+
+## Interview talking points
+
+- **Why Kafka?** Decouples ingestion from scoring; replay offsets to reprocess after model changes; partitions scale consumers.
+- **Why Redis + Neo4j?** Redis for sub-ms velocity / alert cache (hot path); Neo4j for multi-hop AML topology (cycles, mule fan-in) that tabular features miss.
+- **Composite score:** Blend supervised XGBoost (transaction features) with unsupervised graph risk so neither false-negatives alone; SHAP for analyst explainability.
+- **Temporal train/test split:** AML episodes spread over a year so leakage from random splits is avoided — interviewers notice this.
+- **Failure modes you fixed:** GDS native projection (no deprecated cypher project); bounded path queries / fast graph path so consumers don’t stall on dense graphs; API-key auth on every route including health.
+- **What you’d productionize next:** Schema registry, DLQ, feature store, model registry/versioning, SSO, alert SLA metrics, and a real cold-path warehouse (Supabase hooks already stubbed).
 
 ## Constraints
 
-- Python 3.11
+- Python 3.11+
 - No LangChain, ChromaDB, Snowflake, or PDF generation
-- Secrets via `.env` only
+- Secrets via `.env` only (Neo4j Compose service never mounts full `.env`)
 - Supabase is external (not in Docker Compose)
 - Kafka client: **confluent-kafka** only (not kafka-python)

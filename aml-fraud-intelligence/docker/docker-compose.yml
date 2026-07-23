@@ -44,6 +44,7 @@ services:
     networks: [aml-network]
 
   # ── Neo4j 5 + Graph Data Science plugin ─────────────────────────────────────
+  # Intentionally NO env_file — only the six Neo4j vars below (avoid leaking .env).
   neo4j:
     image: neo4j:5.18-enterprise
     environment:
@@ -65,6 +66,28 @@ services:
       timeout: 10s
       retries: 5
       start_period: 60s
+    networks: [aml-network]
+
+  # ── Streamlit dashboard (Phase 7) ───────────────────────────────────────────
+  streamlit:
+    image: python:3.11-slim
+    working_dir: /app
+    volumes:
+      - ..:/app
+    command: >
+      bash -c "pip install --quiet streamlit plotly pyvis requests python-dotenv pandas
+      && streamlit run dashboard/Home.py --server.port 8501 --server.address 0.0.0.0"
+    ports:
+      - "8501:8501"
+    env_file: ../.env
+    environment:
+      BACKEND_URL: http://host.docker.internal:8000
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      - kafka
+      - redis
+      - neo4j
     networks: [aml-network]
 
 volumes:

@@ -12,13 +12,22 @@ from graph.queries import detect_cycles, detect_layering, detect_mule, get_pager
 
 
 class GraphRiskScorer:
-    async def score(self, account_id: str) -> dict[str, Any]:
+    async def score(self, account_id: str, *, fast: bool = False) -> dict[str, Any]:
+        """
+        Full score uses cycles + mule + layering + PageRank.
+        fast=True skips expensive variable-length path queries (streaming path).
+        """
         driver = get_driver()
         async with driver.session() as session:
-            cycles = await detect_cycles(session, account_id)
             mule = await detect_mule(session, account_id)
-            layering = await detect_layering(session, account_id)
             pagerank = await get_pagerank(session, account_id)
+            if fast:
+                # Streaming: cycles are bounded (LIMIT); skip layering (path explosion).
+                cycles = await detect_cycles(session, account_id)
+                layering = []
+            else:
+                cycles = await detect_cycles(session, account_id)
+                layering = await detect_layering(session, account_id)
 
         cycle_count = len(cycles)
         is_mule = bool(mule.get("is_mule"))

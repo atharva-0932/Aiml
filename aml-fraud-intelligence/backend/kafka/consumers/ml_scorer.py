@@ -11,8 +11,10 @@ from confluent_kafka import Consumer, KafkaError, KafkaException
 
 from core.config import settings
 from db.redis.cache import (
+    cache_alert,
     cache_graph_risk,
     cache_risk_score,
+    cache_shap,
     get_cached_graph_risk,
     get_velocity_features,
     update_velocity,
@@ -44,7 +46,23 @@ async def _graph_score_cached(graph_scorer: GraphRiskScorer, account_id: str) ->
     cached = await get_cached_graph_risk(account_id)
     if cached is not None:
         return cached
-    result = await graph_scorer.score(account_id)
+    try:
+        # Streaming path: mule + PageRank only (cycles/layering too slow at volume).
+        result = await asyncio.wait_for(
+            graph_scorer.score(account_id, fast=True),
+            timeout=3.0,
+        )
+    except (asyncio.TimeoutError, Exception) as exc:
+        print(f"graph score fallback for {account_id[:8]}…: {exc}")
+        result = {
+            "account_id": account_id,
+            "graph_risk": 0.0,
+            "cycle_count": 0,
+            "is_mule": False,
+            "layering_depth": 0,
+            "pagerank": 0.0,
+            "flags": [],
+        }
     await cache_graph_risk(account_id, result)
     return result
 
@@ -68,11 +86,18 @@ async def process_message(
     shap_top = xgb_scorer.shap_top_features(features, top_k=5)
 
     await cache_risk_score(tx["transaction_id"], combined["composite_score"])
+    await cache_shap(tx["transaction_id"], shap_top)
     await update_velocity(sender, receiver, amount)
     await upsert_transaction(tx, combined["composite_score"])
     await insert_shap_explanations(tx["transaction_id"], shap_top)
 
     if combined["composite_score"] > 70:
+        await cache_alert(
+            tx["transaction_id"],
+            combined["composite_score"],
+            combined["tier"],
+            tx.get("pattern_label"),
+        )
         await insert_alert(
             tx["transaction_id"],
             combined["composite_score"],
