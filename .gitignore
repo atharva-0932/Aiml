@@ -30,6 +30,10 @@ data/transactions.csv
 backend/ml/models/*
 !backend/ml/models/.gitkeep
 
+# PyVis / Streamlit generated assets
+lib/
+dashboard/lib/
+
 # Testing
 .pytest_cache/
 .coverage

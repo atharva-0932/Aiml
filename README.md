@@ -113,7 +113,7 @@ Mermaid versions (architecture + analyst flow): [`docs/diagrams.md`](docs/diagra
 ## Repository layout
 
 ```
-aml-fraud-intelligence/
+.
 ├── backend/
 │   ├── api/                  # FastAPI app, auth, routes, CSV store
 │   ├── core/                 # Settings from .env
@@ -143,6 +143,7 @@ aml-fraud-intelligence/
 ├── docs/diagrams.md
 ├── tests/unit/               # 17 tests
 ├── .env.example
+├── .gitignore
 ├── pyproject.toml
 └── README.md
 ```
@@ -405,12 +406,10 @@ If `SUPABASE_DB_URL` is unset/placeholder, writes are skipped safely.
 ### Install
 
 ```bash
-cd aml-fraud-intelligence
 cp -n .env.example .env
 # edit API_KEY / connection URLs if needed
 pip install -e ".[dev]"
 ```
-
 ### Full demo sequence
 
 ```bash
